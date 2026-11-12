@@ -198,12 +198,20 @@ func sortInts(a []int) {
 	}
 }
 
-// backfillToolCallNames 维护跨帧的 tool_calls name 缓存并回填：
-// 上游流式分片中，首 chunk 带 function.name，后续 chunk 常缺省或置空 ""，
-// 逐 chunk 消费的客户端会把工具名清空导致 tool call 卡死（hawklithm/workbuddy2api issue#2）。
-// 按 delta.tool_calls 的 index 缓存首现的非空 name，后续分片缺 name 时回填；
-// 只动 tool_calls 的 function.name 字段，其余透传不变。
-func backfillToolCallNames(obj map[string]any, names map[int]string) {
+// normalizeToolCallDeltas 规范流式 tool_calls 分片（OpenAI Chat Completions 流式协议）：
+//   - 首片带非空 function.name → 原样保留；
+//   - 后续片 name 为空串/缺失 → 删除该字段，只留 arguments 片段。
+//
+// 背景（两个客户端缺陷的收敛解）：
+//   - issue#2：上游后续分片把 name 置空 ""，逐 chunk 消费的客户端据此清空工具名，
+//     tool call 卡死；
+//   - IDE / agent 客户端：若给后续分片回填 name，按 name 判定「新调用」的解析器会
+//     反复重置 arguments 缓冲，最终只剩最后一个片段，表现为「工具入参连续被截断」
+//     并最终报「系统发生异常」。
+//
+// 早期实现按 index 缓存首片 name 并回填到每个后续片，修好了前者却触发后者。
+// 正解是删除空 name：undefined 既不会清空客户端缓存，也不会被误判为新调用。
+func normalizeToolCallDeltas(obj map[string]any) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
@@ -220,29 +228,12 @@ func backfillToolCallNames(obj map[string]any, names map[int]string) {
 			if tc == nil {
 				continue
 			}
-			idx := 0
-			if v, ok := tc["index"].(float64); ok {
-				idx = int(v)
-			}
 			fn, _ := tc["function"].(map[string]any)
-			name := ""
-			if fn != nil {
-				if v, ok := fn["name"].(string); ok {
-					name = v
-				}
-			}
-			if name != "" {
-				// 缓存：后续分片以本次为准（覆盖旧值，允许上游中途改名）。
-				names[idx] = name
+			if fn == nil {
 				continue
 			}
-			// 缺/空 name：从缓存回填（首现分片已缓存，这里命中同 index 的后续分片）。
-			if cached, ok := names[idx]; ok {
-				if fn == nil {
-					fn = map[string]any{}
-					tc["function"] = fn
-				}
-				fn["name"] = cached
+			if name, _ := fn["name"].(string); name == "" {
+				delete(fn, "name")
 			}
 		}
 	}
@@ -250,8 +241,16 @@ func backfillToolCallNames(obj map[string]any, names map[int]string) {
 
 // normalizeFrame 以 OpenAI 流式规范白名单重建帧：仅保留标准字段，
 // 剔除上游噪声（finish_reason:"" → null、空 content/refusal、空 tool_calls 列表、
-// 空占位 function_call、顶层未知字段），空 delta 键一律省略，
-// usage 缺失 → null，保证任意标准客户端按规范解析。
+// 空占位 function_call、顶层未知字段），空 delta 键一律省略。
+//
+// 客户端兼容约束（AI agent / IDE 客户端按 chunk 逐帧解析，字段形态非标准会抛异常）：
+//   - choices 恒存在：上游只带 usage 的末帧按规范输出空数组 []，否则
+//     严格客户端访问 chunk.choices[0] 会得到 undefined；
+//   - 每个 choice 恒带 index / delta / finish_reason；
+//   - usage 只在上游显式给出且非 nil 时透传，中间帧不再输出 "usage":null
+//     （OpenAI 规范中间帧不带该键，客户端对 null 取子字段会崩）；
+//   - 上游 error 字段原样透传：此前被白名单剥成无意义空帧，客户端只看到
+//     HTTP 200 + 空 chunk，报泛化「系统异常」，无法定位上游错误。
 func normalizeFrame(obj map[string]any) map[string]any {
 	out := map[string]any{}
 	for _, k := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
@@ -265,6 +264,12 @@ func normalizeFrame(obj map[string]any) map[string]any {
 	if _, ok := out["id"]; !ok {
 		out["id"] = "chatcmpl-wb2api"
 	}
+	// 上游以 200 + SSE error 帧报错时，error 字段必须活着到达客户端。
+	if e, ok := obj["error"]; ok && e != nil {
+		out["error"] = e
+	}
+	// choices 恒存在（无 choices 的上游帧按标准给空数组）。
+	out["choices"] = []any{}
 	if chs, ok := obj["choices"].([]any); ok {
 		nchs := make([]any, 0, len(chs))
 		for _, ci := range chs {
@@ -275,6 +280,8 @@ func normalizeFrame(obj map[string]any) map[string]any {
 			nc := map[string]any{}
 			if idx, ok := c["index"]; ok {
 				nc["index"] = idx
+			} else {
+				nc["index"] = 0 // OpenAI 规范要求 choice 恒带 index
 			}
 			delta := map[string]any{}
 			if d, ok := c["delta"].(map[string]any); ok {
@@ -318,10 +325,9 @@ func normalizeFrame(obj map[string]any) map[string]any {
 		}
 		out["choices"] = nchs
 	}
-	if u, ok := obj["usage"]; ok {
+	// usage 只在上游显式提供时出现（中间帧不输出 usage:null）。
+	if u, ok := obj["usage"]; ok && u != nil {
 		out["usage"] = u
-	} else {
-		out["usage"] = nil
 	}
 	return out
 }
@@ -329,6 +335,8 @@ func normalizeFrame(obj map[string]any) map[string]any {
 // Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
 // 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
+// 上游注释/心跳行静默丢弃：客户端帧流只含标准 data: 帧，避免简易解析器
+// 把非 data 行当异常（保活由数据帧承担）。
 func Stream(w http.ResponseWriter, r io.Reader) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -336,10 +344,6 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
-
-	// toolCallNames 跨帧维护 delta.tool_calls[index] → function.name，
-	// 供逐 chunk 透传时回填被上游清空的 name（hawklithm/workbuddy2api issue#2）。
-	toolCallNames := map[int]string{}
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
@@ -352,8 +356,8 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		var obj map[string]any
 		valid := 0
 		if json.Unmarshal([]byte(payload), &obj) == nil {
-			// 先按 index 回填 tool_calls name（上游后续 chunk 常缺省/置空），再规范化透传。
-			backfillToolCallNames(obj, toolCallNames)
+			// 先规范 tool_calls 分片（删除后续片的空 name），再规范化透传。
+			normalizeToolCallDeltas(obj)
 			// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
 			// 有自己 id 的帧保持原样（不同流分裂的帧允许各自 id）。
 			if firstID == "" {
@@ -409,13 +413,9 @@ readLoop:
 				return werr
 			}
 		case trimmed != "":
-			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
-				return werr
-			}
-			if fl != nil {
-				fl.Flush()
-			}
+			// 上游注释/心跳行（如 ": heartbeat"）与其它非 data 协议行静默丢弃：
+			// SSE 注释虽合规，但部分 IDE 客户端用简易解析器会把非 data 行当异常帧；
+			// 连接保活由已写出的数据帧承担，无需透传注释。
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
 		if err != nil {

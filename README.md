@@ -152,6 +152,111 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 ```
 
+### 启动网关（二进制）
+
+`go build` 产物是 `wb2api`（Windows 下为 `wb2api.exe`）。它**必须从项目根目录启动**——会读取当前工作目录下的 `config.json`（用 `-config <路径>` 可换位置）与 `auths/` 凭证目录，默认监听 `:7863`。原生二进制**不热加载**凭证，新增 / 更换账号后需重启网关（见下文「登录」）。
+
+**前台启动**（占住当前终端，Ctrl+C 停止）：
+
+```bash
+# Git Bash / Linux
+cd /path/to/workbuddy2api
+./wb2api                 # 等价于 ./wb2api -config config.json
+```
+
+```powershell
+# PowerShell（Windows，若 Git Bash 构建产物不带 .exe 后缀则去掉 .exe）
+cd D:\path\to\workbuddy2api
+.\wb2api.exe
+```
+
+**后台启动（推荐，落日志便于排查）**：
+
+```bash
+# Git Bash
+cd /path/to/workbuddy2api
+./wb2api > wb2api.log 2>&1 &
+```
+
+```powershell
+# PowerShell：Start-Process 非阻塞启动，stdout/stderr 分别落盘
+cd D:\path\to\workbuddy2api
+Start-Process -FilePath ".\wb2api.exe" -RedirectStandardOutput "wb2api.log" -RedirectStandardError "wb2api.err"
+```
+
+**验证启动成功**：
+
+```bash
+# 账号池状态（需鉴权，healthy > 0 即账号已加载）
+curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
+# 或免鉴权的健康检查
+curl -s http://localhost:7863/healthz
+```
+
+**停止服务**：
+
+```powershell
+Stop-Process -Name wb2api          # PowerShell
+```
+```bash
+pkill -f wb2api                     # Git Bash / Linux
+```
+
+> ⚠️ `wb2api` 是常驻前台进程：**关闭终端、注销、重启电脑都会让它退出**。进程意外退出后直接重跑上面的启动命令即可，无需重新登录；除非 `/status` 中账号变为 `disabled`（此时需按「登录」重新授权并重启）。
+
+### Windows 下运行工具（无 Linux 环境）
+
+仓库里的 `*.sh` 是 bash 脚本，Windows 无法直接运行；它们只是对仓库内 Go 原生二进制（`login` / `signin_bin` / `credit`）的封装。**在 Windows 上直接用对应的 `.exe` 即可**——`go build` 在 Windows 下产物自带 `.exe` 后缀。PowerShell 中 `curl` 是 `Invoke-WebRequest` 的别名，但 `login.exe` 等是程序本体，正常调用即可。
+
+> 注：若你在 Git Bash 下构建，产物可能不带 `.exe` 后缀，命令里去掉 `.exe` 即可（如 `./login`、`signin_bin`）。
+
+**登录（添加账号）** —— 分两步，中间需你在浏览器完成扫码 / 授权：
+
+```powershell
+# 1) 取授权链接（realm 可选 cn / global；不传回落 cn）
+login.exe --realm=cn url
+#   ↓ 复制终端打印的 https://copilot.tencent.com/login?... 链接，浏览器打开并完成登录
+
+# 2) 登录完成后，轮询 token 并落盘为 auths/workbuddy-<uid>.json（格式与网关读取一致）
+#    注意：Windows PowerShell 5.1 默认按系统 OEM 码页（中文系统为 GBK）解码外部程序
+#    stdout，而 login.exe 输出 UTF-8，需先切到 UTF-8，否则中文 nickname 会乱码。
+$prevEnc = [Console]::OutputEncoding
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$json = login.exe --realm=cn poll | ConvertFrom-Json
+[Console]::OutputEncoding = $prevEnc
+$uid  = $json.uid
+$exp  = [int][datetime]::UtcNow.Subtract([datetime]'1970-01-01').TotalSeconds + [int]$json.expires_in
+$auth = @{
+    account = @{ uid = $uid; enterpriseId = $json.enterprise_id; nickname = $json.nickname }
+    auth    = @{
+        accessToken  = $json.access_token
+        refreshToken = $json.refresh_token
+        expiresAt    = $exp
+        domain       = $json.domain
+        realm        = 'cn'
+    }
+} | ConvertTo-Json -Depth 5
+New-Item -ItemType Directory -Force -Path auths | Out-Null
+[System.IO.File]::WriteAllText("auths/workbuddy-$uid.json", $auth, [System.Text.UTF8Encoding]::new($false))
+Write-Host "已保存 auths/workbuddy-$uid.json"
+```
+
+> 登录后**必须重启网关**才能加载新账号：原生二进制不热加载凭证（仅在启动时扫描 `auths/`）。停掉 `wb2api` 进程后重新 `.\wb2api.exe -config config.json` 即可，无需像脚本那样 `docker restart`。CN 首次签到可省略，网关内置 09 / 21 点定时签到。
+
+**签到（批量）** —— 遍历 `auths/` 下所有账号执行签到：
+
+```powershell
+signin_bin.exe            # 默认目录 auths
+# 或指定目录：signin_bin.exe D:\path\to\auths
+```
+
+**积分日报** —— 查看各账号积分：
+
+```powershell
+credit.exe -pretty       # 人类可读日报（默认）
+credit.exe               # 原始 JSON
+```
+
 ### 验证
 
 ```bash
@@ -165,21 +270,79 @@ curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
 curl -sN http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
 
 # 非流式聊天（本地聚合）
 curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+> **Windows 提示**：PowerShell 中 `curl` 是 `Invoke-WebRequest` 的别名，**必须用 `curl.exe`** 调用真正的 curl 程序；Windows 10 / 11 已内置 curl（cmd 与 PowerShell 均可直接用）。下面给出与上方等价的 Windows 写法。
+
+**CMD（命令提示符）** —— 行尾用 `^` 续行；JSON 内的双引号用 `\"` 转义：
+
+```cmd
+:: 流式聊天
+curl -sN http://localhost:7863/v1/chat/completions ^
+  -H "Authorization: Bearer your-api-key" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model\":\"deepseek-v4.1-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"
+
+:: 非流式聊天（本地聚合）
+curl -s http://localhost:7863/v1/chat/completions ^
+  -H "Authorization: Bearer your-api-key" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model\":\"deepseek-v4.1-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}"
 ```
+
+**PowerShell** —— **不能**像 bash 那样用 `-d '{...}'` 单引号直接包 JSON 传给 curl。PowerShell 5.1 会把 JSON 开头 `{` 紧跟的前双引号吞掉，导致服务端收到 `{model...` 而报 `invalid character 'm'`（错误码 11101）。两种可靠写法：
+
+写法 A（推荐，零转义 + 多行不依赖续行符）—— 先把 JSON 写成**无 BOM 的 UTF-8** 文件，再用 `-d @文件` 让 curl 读取；多行参数用 PowerShell 数组（**splatting**，`@(...)`）传递，**不依赖反引号续行，复制粘贴混进尾随空格也不会断行**：
+
+```powershell
+# 流式聊天
+$json = '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
+[System.IO.File]::WriteAllText("$PWD\body.json", $json, [System.Text.UTF8Encoding]::new($false))
+$argList = @(
+  '-sN'
+  'http://localhost:7863/v1/chat/completions'
+  '-H', 'Authorization: Bearer your-api-key'
+  '-H', 'Content-Type: application/json'
+  '-d', "@$PWD\body.json"
+)
+curl.exe @argList
+
+# 非流式聊天（本地聚合）
+$json = '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+[System.IO.File]::WriteAllText("$PWD\body.json", $json, [System.Text.UTF8Encoding]::new($false))
+$argList = @(
+  '-s'
+  'http://localhost:7863/v1/chat/completions'
+  '-H', 'Authorization: Bearer your-api-key'
+  '-H', 'Content-Type: application/json'
+  '-d', "@$PWD\body.json"
+)
+curl.exe @argList
+```
+
+写法 B（单行，类似 CMD）—— 在 `curl.exe` 后加 `--%` 停止解析，后续引号按 CMD 风格用 `\"` 转义：
+
+```powershell
+# 流式聊天
+curl.exe --% -sN http://localhost:7863/v1/chat/completions -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" -d "{\"model\":\"deepseek-v4.1-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"
+
+# 非流式聊天（本地聚合）
+curl.exe --% -s http://localhost:7863/v1/chat/completions -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" -d "{\"model\":\"deepseek-v4.1-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}"
+```
+
 
 ## 安全与合规
 
 ### 发布来源与合规边界
 
 - **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
-- 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
+- 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`（Linux / 容器环境）。这三个脚本均为 Go 原生二进制（`login` / `signin_bin` / `credit`）的薄封装，**Windows 无 Linux 环境时无需跑 `.sh`，直接调用对应的 `.exe` 即可**，详见下方「Windows 下运行工具（无 Linux 环境）」。
 - **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
 - 上游 CodeBuddy 属第三方商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 

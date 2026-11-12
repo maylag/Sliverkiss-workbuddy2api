@@ -12,6 +12,7 @@ data/
 /credit
 /wb2api
 /signin_bin
+*.exe
 
 # Config with secrets (use config.example.json)
 config.json
@@ -19,6 +20,8 @@ config.json
 # Build artifacts
 *.tmp
 __pycache__/
+*.log
+*.err
 
 # Backups (contains auth tokens)
 backups/
