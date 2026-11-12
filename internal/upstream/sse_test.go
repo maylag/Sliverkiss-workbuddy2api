@@ -148,9 +148,9 @@ data: [DONE]
 	}
 }
 
-// TestBackfillToolCallNames 直测跨帧 name 缓存：首 chunk 带 name 时建缓存，
-// 后续 chunk 缺省/置空 name 时从缓存回填（hawklithm/workbuddy2api issue#2）。
-func TestBackfillToolCallNames(t *testing.T) {
+// TestNormalizeToolCallDeltas 直测分片规范化：首片保留 name；后续片的空 name 被删除，
+// 且绝不主动补 name（按 name 判定新调用的客户端会因此截断 arguments）。
+func TestNormalizeToolCallDeltas(t *testing.T) {
 	mkFrame := func(name, args string) map[string]any {
 		fn := map[string]any{}
 		if name != "" {
@@ -165,70 +165,63 @@ func TestBackfillToolCallNames(t *testing.T) {
 			}}},
 		}}
 	}
-	names := map[int]string{}
 
-	// 首 chunk 带 name：缓存建好
+	// 首片带 name：原样保留
 	f0 := mkFrame("lookup", "")
-	backfillToolCallNames(f0, names)
-	if names[0] != "lookup" {
-		t.Fatalf("cache after first chunk=%v want lookup", names)
+	normalizeToolCallDeltas(f0)
+	fn0 := f0["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if fn0["name"] != "lookup" {
+		t.Fatalf("first chunk name=%v want lookup", fn0["name"])
 	}
 
-	// 后续 chunk name 为空串：回填 "lookup"
+	// 后续片 name 为空串：删除该字段，不回填
 	f1 := mkFrame("", `{"term":"x"}`)
-	backfillToolCallNames(f1, names)
+	normalizeToolCallDeltas(f1)
 	fn1 := f1["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-	if fn1["name"] != "lookup" {
-		t.Errorf("empty name not backfilled: %v", fn1["name"])
+	if _, ok := fn1["name"]; ok {
+		t.Errorf("follow-up chunk must not carry name: %v", fn1)
+	}
+	if fn1["arguments"] != `{"term":"x"}` {
+		t.Errorf("arguments altered: %v", fn1["arguments"])
 	}
 
-	// 后续 chunk 缺省 name（function 仅 arguments）：同样回填
+	// 后续片本就缺省 name：保持缺省，不新增
 	f2 := map[string]any{"choices": []any{
 		map[string]any{"delta": map[string]any{"tool_calls": []any{
 			map[string]any{"index": 0.0, "function": map[string]any{"arguments": "y"}},
 		}}},
 	}}
-	backfillToolCallNames(f2, names)
+	normalizeToolCallDeltas(f2)
 	fn2 := f2["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-	if fn2["name"] != "lookup" {
-		t.Errorf("missing name not backfilled: %v", fn2["name"])
+	if _, ok := fn2["name"]; ok {
+		t.Errorf("missing name must stay missing: %v", fn2)
 	}
 
-	// 不同 index 互不串扰
+	// 不同 index 互不串扰：各自的空 name 都被删除
 	f3 := map[string]any{"choices": []any{
 		map[string]any{"delta": map[string]any{"tool_calls": []any{
-			map[string]any{"index": 1.0, "function": map[string]any{}},
+			map[string]any{"index": 1.0, "function": map[string]any{"name": "", "arguments": "z"}},
 		}}},
 	}}
-	backfillToolCallNames(f3, names)
-	if _, ok := names[1]; ok {
-		t.Error("index 1 should not get a cached name")
-	}
-	f3call := f3["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
-	if _, hasFn := f3call["function"]; !hasFn {
-		t.Error("index 1 with no cache should leave function empty (no phantom name)")
+	normalizeToolCallDeltas(f3)
+	fn3 := f3["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if _, ok := fn3["name"]; ok {
+		t.Errorf("index 1 empty name should be dropped: %v", fn3)
 	}
 
-	// 无缓存未命中：原帧原样不动
-	names2 := map[int]string{}
-	f4 := mkFrame("", `{"z":"1"}`)
-	backfillToolCallNames(f4, names2)
-	if json, _ := json.Marshal(f4); strings.Contains(string(json), "name") {
-		t.Errorf("uncached frame should not gain a name: %s", json)
-	}
 	// 非 tool_calls 帧（content only）零影响
 	f5 := map[string]any{"choices": []any{
 		map[string]any{"delta": map[string]any{"content": "hi"}},
 	}}
-	backfillToolCallNames(f5, names)
+	normalizeToolCallDeltas(f5)
 	if got := f5["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any); len(got) != 1 || got["content"] != "hi" {
 		t.Errorf("content-only frame altered: %#v", got)
 	}
 }
 
-// TestStreamBackfillsToolCallName 端到端：SSE 流首 chunk 带 name，后续 chunk name 被置空，
-// 逐帧透传后每个工具分片都必须回填 name（hawklithm/workbuddy2api issue#2）。
-func TestStreamBackfillsToolCallName(t *testing.T) {
+// TestStreamNormalizesToolCallDeltas 端到端：SSE 流首片带 name，后续片 name 被置空，
+// 透传后只有首片保留 name，后续片仅带 arguments 片段（OpenAI 流式协议）。
+func TestStreamNormalizesToolCallDeltas(t *testing.T) {
 	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
 		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"term\\\":\"}}]}}]}\n\n" +
 		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"\\\"北京\\\"}\"}}]}}]}\n\n" +
@@ -242,7 +235,14 @@ func TestStreamBackfillsToolCallName(t *testing.T) {
 	if len(frames) != 4 {
 		t.Fatalf("frames=%d want 4", len(frames))
 	}
-	// 每个含 tool_calls 的分片 name 都必须是 lookup（首 chunk 直通，后续 chunk 被回填）
+
+	type deltaCall struct {
+		frame   int
+		hasName bool
+		name    string
+		args    string
+	}
+	var calls []deltaCall
 	for i, fr := range frames {
 		chs, ok := fr["choices"].([]any)
 		if !ok {
@@ -253,18 +253,31 @@ func TestStreamBackfillsToolCallName(t *testing.T) {
 		if !ok {
 			continue // 末帧只有 finish_reason，无 tool_calls 属正常
 		}
-		if len(tcs) != 1 {
-			t.Fatalf("frame %d tool_calls len=%d want 1", i, len(tcs))
-		}
-		fn, ok := tcs[0].(map[string]any)["function"].(map[string]any)
-		if !ok || fn["name"] != "lookup" {
-			t.Errorf("frame %d tool_calls name=%v want lookup", i, fn["name"])
+		for _, tci := range tcs {
+			tc := tci.(map[string]any)
+			fn, _ := tc["function"].(map[string]any)
+			c := deltaCall{frame: i}
+			if fn != nil {
+				c.name, _ = fn["name"].(string)
+				_, c.hasName = fn["name"]
+				c.args, _ = fn["arguments"].(string)
+			}
+			calls = append(calls, c)
 		}
 	}
-	// arguments 必须跨 chunk 完整保流（回填只动 name，不动其余字段）
-	f1 := frames[1]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-	if f1["arguments"] != `{"term":` {
-		t.Errorf("frame 2 arguments=%q", f1["arguments"])
+	if len(calls) != 3 {
+		t.Fatalf("tool_calls 分片数=%d want 3", len(calls))
+	}
+	if !calls[0].hasName || calls[0].name != "lookup" {
+		t.Errorf("首片必须带 name: %+v", calls[0])
+	}
+	for i := 1; i < len(calls); i++ {
+		if calls[i].hasName {
+			t.Errorf("frame %d 后续片不应带 name=%q（会导致 arguments 缓冲被重置）", calls[i].frame, calls[i].name)
+		}
+	}
+	if calls[1].args != `{"term":` || calls[2].args != `"北京"}` {
+		t.Errorf("arguments 片段未完整保留: %+v", calls)
 	}
 }
 
@@ -303,27 +316,27 @@ func TestNormalizeFrame(t *testing.T) {
 			map[string]any{"id": "x", "choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"content": "", "refusal": ""}, "finish_reason": ""},
 			}},
-			`{"choices":[{"delta":{},"finish_reason":null,"index":0}],"id":"x","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{},"finish_reason":null,"index":0}],"id":"x","object":"chat.completion.chunk"}`},
 		{"non-empty tool_calls kept",
 			map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{"id": "c1", "type": "function"}}}},
 			}},
-			`{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function"}]},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{"tool_calls":[{"id":"c1","type":"function"}]},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk"}`},
 		{"empty tool_calls list dropped",
 			map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{}, "content": "hi"}},
 			}},
-			`{"choices":[{"delta":{"content":"hi"},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{"content":"hi"},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk"}`},
 		{"empty placeholder function_call dropped",
 			map[string]any{"choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{"function_call": map[string]any{"name": "", "arguments": ""}}},
 			}},
-			`{"choices":[{"delta":{},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk","usage":null}`},
-		{"top-level unknown fields dropped, usage null when absent",
+			`{"choices":[{"delta":{},"finish_reason":null,"index":0}],"id":"chatcmpl-wb2api","object":"chat.completion.chunk"}`},
+		{"top-level unknown fields dropped, usage omitted when absent",
 			map[string]any{"id": "x", "object": "chat.completion.chunk", "created": 1, "junk": "noise", "choices": []any{
 				map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"},
 			}},
-			`{"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1,"id":"x","object":"chat.completion.chunk","usage":null}`},
+			`{"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1,"id":"x","object":"chat.completion.chunk"}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -354,13 +367,13 @@ func TestStreamNormalizesFrames(t *testing.T) {
 		t.Fatalf("frames=%d want 3", len(frames))
 	}
 
-	// 帧 1：噪声全剔除，finish_reason ""→null，usage 缺失→null，顶层非标字段剥除
+	// 帧 1：噪声全剔除，finish_reason ""→null，usage 缺失→不输出该键，顶层非标字段剥除
 	f0 := frames[0]
 	if _, ok := f0["extra_field"]; ok {
 		t.Error("top-level extra_field should be dropped")
 	}
-	if f0["usage"] != nil {
-		t.Errorf("usage should be null when absent, got %v", f0["usage"])
+	if _, ok := f0["usage"]; ok {
+		t.Errorf("usage key must be absent on intermediate frames, got %v", f0["usage"])
 	}
 	ch0 := f0["choices"].([]any)[0].(map[string]any)
 	if ch0["finish_reason"] != nil {
@@ -663,5 +676,119 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 				t.Errorf("frame not normalized: %q", body)
 			}
 		})
+	}
+}
+
+// TestNormalizeFrameClientCompatShape 覆盖 AI agent / IDE 客户端按 chunk 逐帧解析时
+// 必需的字段形态：choices/delta/index 恒存在、usage 只在末帧出现、error 帧可识别。
+func TestNormalizeFrameClientCompatShape(t *testing.T) {
+	t.Run("usage-only frame keeps empty choices", func(t *testing.T) {
+		out := normalizeFrame(map[string]any{"id": "x", "usage": map[string]any{"total_tokens": 7}})
+		chs, ok := out["choices"].([]any)
+		if !ok || len(chs) != 0 {
+			t.Fatalf("choices=%#v want empty array", out["choices"])
+		}
+		if out["usage"] == nil {
+			t.Error("usage must be preserved when upstream provides it")
+		}
+	})
+
+	t.Run("intermediate frame omits usage key", func(t *testing.T) {
+		out := normalizeFrame(map[string]any{"choices": []any{
+			map[string]any{"delta": map[string]any{"content": "hi"}},
+		}})
+		if _, ok := out["usage"]; ok {
+			t.Errorf("intermediate frame must not carry usage, got %v", out["usage"])
+		}
+		ch := out["choices"].([]any)[0].(map[string]any)
+		if ch["index"] != 0 {
+			t.Errorf("index=%v want 0", ch["index"])
+		}
+		if _, ok := ch["delta"]; !ok {
+			t.Error("delta must be present")
+		}
+		if _, ok := ch["finish_reason"]; !ok {
+			t.Error("finish_reason must be present")
+		}
+	})
+
+	t.Run("upstream error field survives whitelist", func(t *testing.T) {
+		errObj := map[string]any{"message": "upstream refused", "type": "upstream_error"}
+		out := normalizeFrame(map[string]any{"id": "x", "error": errObj})
+		got, ok := out["error"].(map[string]any)
+		if !ok || got["message"] != "upstream refused" {
+			t.Fatalf("error field stripped: %#v", out)
+		}
+		if _, ok := out["choices"]; !ok {
+			t.Error("choices must be present even on error frames")
+		}
+	})
+}
+
+// TestStreamClientCompatFrames 校验真实流式输出：中间帧无 usage 键、注释行不透传、
+// choices 恒存在、[DONE] 恰好一个、末帧 usage 保留。
+func TestStreamClientCompatFrames(t *testing.T) {
+	raw := ": heartbeat\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":7}}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "heartbeat") {
+		t.Errorf("upstream comment line leaked: %q", body)
+	}
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1", n)
+	}
+	var frames []map[string]any
+	for _, ln := range strings.Split(body, "\n") {
+		ln = strings.TrimSpace(ln)
+		if !strings.HasPrefix(ln, "data: ") || strings.TrimPrefix(ln, "data: ") == "[DONE]" {
+			continue
+		}
+		var f map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(ln, "data: ")), &f); err != nil {
+			t.Fatalf("bad frame %q: %v", ln, err)
+		}
+		frames = append(frames, f)
+		if _, ok := f["choices"]; !ok {
+			t.Errorf("frame missing choices: %v", f)
+		}
+	}
+	if len(frames) != 3 {
+		t.Fatalf("frames=%d want 3", len(frames))
+	}
+	for i := 0; i < 2; i++ {
+		if _, ok := frames[i]["usage"]; ok {
+			t.Errorf("frame %d carries usage (must be omitted): %v", i, frames[i]["usage"])
+		}
+	}
+	if frames[2]["usage"] == nil {
+		t.Error("final frame lost usage object")
+	}
+}
+
+// TestStreamKeepsUpstreamErrorFrame 校验上游以 200 + SSE error 帧报错时，
+// error 字段不被白名单剥成空帧（客户端才能显示具体错误而非泛化异常）。
+func TestStreamKeepsUpstreamErrorFrame(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"error\":{\"message\":\"upstream refused\",\"type\":\"upstream_error\"}}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "upstream refused") {
+		t.Errorf("error field stripped: %q", body)
+	}
+	if strings.Contains(body, "empty upstream stream") {
+		t.Errorf("valid error frame must not trigger empty-stream fallback: %q", body)
+	}
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1", n)
 	}
 }
